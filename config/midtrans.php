@@ -16,18 +16,64 @@ $midtrans_status_url = $is_production ? 'https://api.midtrans.com/v2/' : 'https:
 // Midtrans JS URL
 $midtrans_js_url = $is_production ? 'https://app.midtrans.com/snap/snap.js' : 'https://app.sandbox.midtrans.com/snap/snap.js';
 
-// Function to check Midtrans transaction status with improved error handling
-function check_transaction_status($order_id) {
-    global $midtrans_server_key, $midtrans_status_url;
+/**
+ * Get Midtrans payment token for Snap.js
+ * 
+ * @param array $transaction_data Transaction data
+ * @return string Midtrans token
+ */
+function get_midtrans_token($transaction_data) {
+    global $midtrans_server_key, $is_production;
     
-    if (empty($order_id)) {
-        return ['error' => "Invalid order ID"];
-    }
+    $url = $is_production 
+        ? 'https://app.midtrans.com/snap/v1/transactions' 
+        : 'https://app.sandbox.midtrans.com/snap/v1/transactions';
     
     $curl = curl_init();
-    
     curl_setopt_array($curl, [
-        CURLOPT_URL => $midtrans_status_url . $order_id . '/status',
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_ENCODING => '',
+        CURLOPT_MAXREDIRS => 10,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+        CURLOPT_CUSTOMREQUEST => 'POST',
+        CURLOPT_POSTFIELDS => json_encode($transaction_data),
+        CURLOPT_HTTPHEADER => [
+            'accept: application/json',
+            'content-type: application/json',
+            'authorization: Basic ' . base64_encode($midtrans_server_key . ':')
+        ],
+    ]);
+    
+    $response = curl_exec($curl);
+    $err = curl_error($curl);
+    curl_close($curl);
+    
+    if ($err) {
+        return ['error' => 'cURL Error: ' . $err];
+    }
+    
+    $response_arr = json_decode($response, true);
+    return isset($response_arr['token']) ? $response_arr['token'] : ['error' => $response_arr['error_messages'][0] ?? 'Unknown error'];
+}
+
+/**
+ * Check Midtrans transaction status
+ * 
+ * @param string $order_id Order ID
+ * @return array Transaction details
+ */
+function check_transaction_status($order_id) {
+    global $midtrans_server_key, $is_production;
+    
+    $url = $is_production 
+        ? "https://api.midtrans.com/v2/{$order_id}/status" 
+        : "https://api.sandbox.midtrans.com/v2/{$order_id}/status";
+    
+    $curl = curl_init();
+    curl_setopt_array($curl, [
+        CURLOPT_URL => $url,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_ENCODING => '',
         CURLOPT_MAXREDIRS => 10,
@@ -35,117 +81,32 @@ function check_transaction_status($order_id) {
         CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
         CURLOPT_CUSTOMREQUEST => 'GET',
         CURLOPT_HTTPHEADER => [
-            'Accept: application/json',
-            'Content-Type: application/json',
-            'Authorization: Basic ' . base64_encode($midtrans_server_key . ':')
+            'accept: application/json',
+            'authorization: Basic ' . base64_encode($midtrans_server_key . ':')
         ],
     ]);
     
     $response = curl_exec($curl);
     $err = curl_error($curl);
-    $httpcode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    
     curl_close($curl);
     
-    // Log the response for debugging if needed
-    // file_put_contents('midtrans_status_log.txt', date('Y-m-d H:i:s') . " - Order ID: $order_id - Response: $response\n", FILE_APPEND);
-    
     if ($err) {
-        return ['error' => "cURL Error #:" . $err];
-    } else {
-        $response_data = json_decode($response, true);
-        
-        // Check for error response from Midtrans
-        if ($httpcode >= 400) {
-            return [
-                'error' => "HTTP Error: " . $httpcode, 
-                'details' => $response_data,
-                'raw_response' => $response
-            ];
-        }
-        
-        return $response_data;
+        return ['error' => 'cURL Error: ' . $err];
     }
+    
+    return json_decode($response, true);
 }
 
-// Function to create Midtrans payment token/URL with improved error handling and validation
-function create_midtrans_transaction($params) {
-    global $midtrans_server_key, $midtrans_api_url;
-    
-    if (empty($params) || !is_array($params)) {
-        return ['error' => "Invalid transaction parameters"];
+/**
+ * Create Midtrans transaction (alias function for get_midtrans_token)
+ * 
+ * @param array $transaction_data Transaction data
+ * @return array Transaction response containing token
+ */
+function create_midtrans_transaction($transaction_data) {
+    $token = get_midtrans_token($transaction_data);
+    if (is_string($token)) {
+        return ['token' => $token];
     }
-    
-    // Validate required fields in params
-    if (!isset($params['transaction_details']) || 
-        !isset($params['transaction_details']['order_id']) || 
-        !isset($params['transaction_details']['gross_amount'])) {
-        return ['error' => "Missing required transaction details"];
-    }
-    
-    // Additional validation for customer details
-    if (isset($params['customer_details'])) {
-        // Validate email format
-        if (isset($params['customer_details']['email']) && 
-            !filter_var($params['customer_details']['email'], FILTER_VALIDATE_EMAIL)) {
-            // Provide a valid default email if the one provided is invalid
-            $params['customer_details']['email'] = 'customer_' . time() . '@example.com';
-        }
-        
-        // Make sure phone has a value
-        if (empty($params['customer_details']['phone'])) {
-            $params['customer_details']['phone'] = '08123456789';
-        }
-    }
-    
-    $curl = curl_init();
-    
-    $post_data = json_encode($params);
-    
-    // Log the request for debugging if needed
-    // file_put_contents('midtrans_request_log.txt', date('Y-m-d H:i:s') . " - Request: $post_data\n", FILE_APPEND);
-    
-    curl_setopt_array($curl, [
-        CURLOPT_URL => $midtrans_api_url,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_ENCODING => '',
-        CURLOPT_MAXREDIRS => 10,
-        CURLOPT_TIMEOUT => 30,
-        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-        CURLOPT_CUSTOMREQUEST => 'POST',
-        CURLOPT_POSTFIELDS => $post_data,
-        CURLOPT_HTTPHEADER => [
-            'Accept: application/json',
-            'Content-Type: application/json',
-            'Authorization: Basic ' . base64_encode($midtrans_server_key . ':')
-        ],
-    ]);
-    
-    $response = curl_exec($curl);
-    $err = curl_error($curl);
-    $httpcode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    
-    curl_close($curl);
-    
-    // Log the response for debugging if needed
-    // file_put_contents('midtrans_response_log.txt', date('Y-m-d H:i:s') . " - Response: $response\n", FILE_APPEND);
-    
-    if ($err) {
-        return ['error' => "cURL Error #:" . $err];
-    } else {
-        $response_data = json_decode($response, true);
-        
-        // Check for error response from Midtrans
-        if ($httpcode >= 400) {
-            return [
-                'error' => "HTTP Error: " . $httpcode, 
-                'details' => $response_data,
-                'raw_response' => $response,
-                'request_data' => $params
-            ];
-        }
-        
-        return $response_data;
-    }
+    return $token; // Return error array
 }
-?>

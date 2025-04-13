@@ -75,95 +75,102 @@ try {
     
     // Create payment record with Midtrans as payment method and add order_id
     $stmt = $pdo->prepare("
-    INSERT INTO payments (tenant_id, amount, payment_date, payment_method, status, order_id)
-    VALUES (?, ?, NOW(), 'midtrans', 'unpaid', ?)
-");
+        INSERT INTO payments (tenant_id, amount, payment_date, payment_method, status, order_id)
+        VALUES (?, ?, NOW(), 'midtrans', 'unpaid', ?)
+    ");
     $stmt->execute([$tenant_id, $room['price'], $order_id]);
     $payment_id = $pdo->lastInsertId();
     
-    // Check the structure of the notifications table
-    $stmt = $pdo->query("DESCRIBE notifications");
-    $notifColumns = $stmt->fetchAll(PDO::FETCH_COLUMN);
-
-    // Determine the correct column names
-    $recipientField = in_array('recipient_id', $notifColumns) ? 'recipient_id' : 
-                     (in_array('user_id', $notifColumns) ? 'user_id' : 'recipient_id');
-    $senderField = in_array('sender_id', $notifColumns) ? 'sender_id' : 
-                  (in_array('created_by', $notifColumns) ? 'created_by' : 'sender_id');
-    $messageField = in_array('message', $notifColumns) ? 'message' : 
-                   (in_array('content', $notifColumns) ? 'content' : 'message');
-    $readField = in_array('is_read', $notifColumns) ? 'is_read' : 
-                (in_array('read', $notifColumns) ? '`read`' : 'is_read');
-
-    // Create notification for admin
-    $adminNotifSQL = "INSERT INTO notifications ($recipientField, $senderField, $messageField, $readField) VALUES (1, ?, ?, 0)";
-    $message = "New booking: User ID {$_SESSION['user_id']} has booked room {$room['name']}";
-    $stmt = $pdo->prepare($adminNotifSQL);
-    $stmt->execute([$_SESSION['user_id'], $message]);
-
-    // Create notification for user
-    $userNotifSQL = "INSERT INTO notifications ($recipientField, $senderField, $messageField, $readField) VALUES (?, 1, ?, 0)";
-    $message = "Your booking for room {$room['name']} has been confirmed. Please complete your payment.";
-    $stmt = $pdo->prepare($userNotifSQL);
-    $stmt->execute([$_SESSION['user_id'], $message]);
+    // Get current user's name for notification
+    $stmt = $pdo->prepare("
+        SELECT CONCAT(first_name, ' ', last_name) as full_name FROM users WHERE id = ?
+    ");
+    $stmt->execute([$_SESSION['user_id']]);
+    $user_name = $stmt->fetchColumn();
+    
+    // Create notification message
+    $message = $user_name . " has booked room " . $room['name'] . " (Room #" . $room_id . ")";
+    
+    // Find admin users to notify instead of assuming ID 1
+    $adminStmt = $pdo->prepare("
+        SELECT id FROM users WHERE role = 'admin'
+    ");
+    $adminStmt->execute();
+    $adminUsers = $adminStmt->fetchAll(PDO::FETCH_COLUMN);
+    
+    // Insert notifications for each admin user
+    if (!empty($adminUsers)) {
+        $notificationStmt = $pdo->prepare("
+            INSERT INTO notifications (recipient_id, created_by, message, is_read, created_at)
+            VALUES (?, ?, ?, 0, NOW())
+        ");
+        
+        foreach ($adminUsers as $adminId) {
+            // Verify the admin user still exists in the database (double-check)
+            $verifyStmt = $pdo->prepare("SELECT id FROM users WHERE id = ?");
+            $verifyStmt->execute([$adminId]);
+            if ($verifyStmt->fetchColumn()) {
+                $notificationStmt->execute([$adminId, $_SESSION['user_id'], $message]);
+            }
+        }
+    }
+    
+    // Create Midtrans transaction
+    $transaction_details = array(
+        'order_id' => $order_id,
+        'gross_amount' => $room['price']
+    );
+    
+    $customer_details = array(
+        'first_name' => $user['first_name'],
+        'last_name' => $user['last_name'],
+        'email' => $user['email'],
+        'phone' => $user['phone'] ?? ''
+    );
+    
+    $item_details = array(
+        array(
+            'id' => 'ROOM' . $room_id,
+            'price' => $room['price'],
+            'quantity' => 1,
+            'name' => 'Room ' . $room['name'] . ' - Monthly Rent'
+        )
+    );
+    
+    $transaction_data = array(
+        'transaction_details' => $transaction_details,
+        'customer_details' => $customer_details,
+        'item_details' => $item_details
+    );
+    
+    // Create Midtrans Token
+    $midtrans_token = get_midtrans_token($transaction_data);
+    
+    // Store token
+    $stmt = $pdo->prepare("
+        UPDATE payments SET midtrans_token = ? WHERE id = ?
+    ");
+    $stmt->execute([$midtrans_token, $payment_id]);
     
     // Commit transaction
     $pdo->commit();
     
-    // Prepare Midtrans transaction parameters
-    $transaction_details = [
-        'order_id' => $order_id,
-        'gross_amount' => (int)$room['price'],
-    ];
-    
-    $customer_details = [
-        'first_name' => $user['first_name'],
-        'last_name' => $user['last_name'],
-        'email' => $user['email'],
-        'phone' => $user['phone'],
-    ];
-    
-    $item_details = [
-        [
-            'id' => 'ROOM-' . $room_id,
-            'price' => (int)$room['price'],
-            'quantity' => 1,
-            'name' => $room['name'] . ' - Monthly Rent',
-        ]
-    ];
-    
-    $transaction_data = [
-        'transaction_details' => $transaction_details,
-        'customer_details' => $customer_details,
-        'item_details' => $item_details,
-    ];
-    
-    // Create Midtrans transaction
-    $midtrans_response = create_midtrans_transaction($transaction_data);
-    
-    if (isset($midtrans_response['error'])) {
-        // Error creating Midtrans transaction
-        throw new Exception("Midtrans error: " . $midtrans_response['error']);
-    }
-    
-    // Store Midtrans token in session to use on the payment page
-    $_SESSION['midtrans_token'] = $midtrans_response['token'];
+    // Store data in session for midtrans-payment.php
+    $_SESSION['midtrans_token'] = $midtrans_token;
     $_SESSION['payment_id'] = $payment_id;
     $_SESSION['order_id'] = $order_id;
     $_SESSION['room_name'] = $room['name'];
     $_SESSION['amount'] = $room['price'];
     
-    // Redirect to Midtrans payment page
+    // Redirect to payment page
     header("Location: index.php?page=midtrans-payment");
     exit;
     
 } catch (Exception $e) {
     // Rollback transaction on error
     $pdo->rollBack();
-    
-    // Set error message and redirect
     $_SESSION['error_message'] = "An error occurred during booking: " . $e->getMessage();
-    header("Location: index.php?page=rooms");
+    header("Location: index.php?page=room-detail&id=" . $room_id);
     exit;
 }
 ?>
