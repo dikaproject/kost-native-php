@@ -4,11 +4,64 @@ require_once 'config/midtrans.php';
 
 $page_title = "Payment";
 
+// Debug variables to help diagnose issues
+$debug_info = [];
+$debug_info['session'] = [
+    'has_token' => isset($_SESSION['midtrans_token']),
+    'has_payment_id' => isset($_SESSION['payment_id']),
+    'has_order_id' => isset($_SESSION['order_id']),
+];
+
 // Check if token exists in session
-if (!isset($_SESSION['midtrans_token']) || empty($_SESSION['midtrans_token'])) {
-    $_SESSION['error_message'] = "Payment session expired or invalid. Please try booking again.";
-    header("Location: index.php?page=rooms");
-    exit;
+if (!isset($_SESSION['midtrans_token']) || empty($_SESSION['midtrans_token']) || 
+    !isset($_SESSION['payment_id']) || empty($_SESSION['payment_id']) ||
+    !isset($_SESSION['order_id']) || empty($_SESSION['order_id'])) {
+    
+    $debug_info['recovery_attempt'] = true;
+    
+    // Check if we can recover the payment info from the database
+    if (isset($_SESSION['user_id']) && !empty($_SESSION['user_id'])) {
+        // Try to find the most recent pending Midtrans payment for this user
+        $stmt = $pdo->prepare("
+            SELECT p.*, t.user_id, r.name as room_name 
+            FROM payments p
+            JOIN tenants t ON p.tenant_id = t.id
+            JOIN rooms r ON t.room_id = r.id
+            WHERE t.user_id = ? 
+            AND p.payment_method = 'midtrans'
+            AND (p.status = 'pending' OR p.status = 'unpaid')
+            AND p.midtrans_token IS NOT NULL
+            ORDER BY p.payment_date DESC
+            LIMIT 1
+        ");
+        $stmt->execute([$_SESSION['user_id']]);
+        $payment = $stmt->fetch();
+        
+        $debug_info['recovery_result'] = [
+            'found_payment' => ($payment !== false),
+        ];
+        
+        if ($payment) {
+            // Restore session variables
+            $_SESSION['midtrans_token'] = $payment['midtrans_token'];
+            $_SESSION['payment_id'] = $payment['id'];
+            $_SESSION['order_id'] = $payment['order_id'];
+            $_SESSION['room_name'] = $payment['room_name'];
+            $_SESSION['amount'] = $payment['amount'];
+            
+            $debug_info['recovery_result']['session_restored'] = true;
+        } else {
+            // Could not recover payment info
+            $_SESSION['error_message'] = "Payment session expired or invalid. Please try again.";
+            header("Location: index.php?page=payments");
+            exit;
+        }
+    } else {
+        // No user ID in session
+        $_SESSION['error_message'] = "Payment session expired or invalid. Please log in and try again.";
+        header("Location: index.php?page=payments");
+        exit;
+    }
 }
 
 // Get payment info from session
@@ -18,16 +71,32 @@ $order_id = $_SESSION['order_id'];
 $room_name = $_SESSION['room_name'];
 $amount = $_SESSION['amount'];
 
+$debug_info['payment_info'] = [
+    'token_length' => strlen($token),
+    'payment_id' => $payment_id,
+    'order_id' => $order_id,
+];
+
 // Check if payment has been processed in case user refreshes the page
 $stmt = $pdo->prepare("
-    SELECT transaction_status FROM payments 
+    SELECT transaction_status, status FROM payments 
     WHERE order_id = ? AND id = ?
 ");
 $stmt->execute([$order_id, $payment_id]);
-$payment_status = $stmt->fetchColumn();
+$payment_data = $stmt->fetch();
+
+$debug_info['payment_status'] = $payment_data;
 
 // If payment is already completed, redirect to payment success page
-if ($payment_status === 'settlement' || $payment_status === 'capture') {
+if (isset($payment_data['transaction_status']) && 
+    ($payment_data['transaction_status'] === 'settlement' || $payment_data['transaction_status'] === 'capture')) {
+    
+    // Update status to paid if not already
+    if ($payment_data['status'] !== 'paid') {
+        $stmt = $pdo->prepare("UPDATE payments SET status = 'paid' WHERE id = ?");
+        $stmt->execute([$payment_id]);
+    }
+    
     unset($_SESSION['midtrans_token']);
     unset($_SESSION['payment_id']);
     unset($_SESSION['order_id']);
@@ -38,6 +107,80 @@ if ($payment_status === 'settlement' || $payment_status === 'capture') {
     header("Location: index.php?page=payments");
     exit;
 }
+
+// If payment is expired or failed, redirect back to payments page
+if (isset($payment_data['transaction_status']) && 
+    in_array($payment_data['transaction_status'], ['expire', 'failure', 'deny', 'cancel'])) {
+    
+    unset($_SESSION['midtrans_token']);
+    unset($_SESSION['payment_id']);
+    unset($_SESSION['order_id']);
+    unset($_SESSION['room_name']);
+    unset($_SESSION['amount']);
+    
+    $_SESSION['error_message'] = "Payment was " . $payment_data['transaction_status'] . ". Please try again.";
+    header("Location: index.php?page=payments");
+    exit;
+}
+
+// Check payment status from Midtrans API
+if (!empty($order_id)) {
+    $transaction = check_transaction_status($order_id);
+    
+    if (!isset($transaction['error']) && isset($transaction['transaction_status'])) {
+        $transaction_status = $transaction['transaction_status'];
+        
+        // Update payment status in the database
+        $payment_status = 'pending';
+        
+        if ($transaction_status === 'settlement' || $transaction_status === 'capture') {
+            $payment_status = 'paid';
+            
+            // Redirect to success page
+            unset($_SESSION['midtrans_token']);
+            unset($_SESSION['payment_id']);
+            unset($_SESSION['order_id']);
+            unset($_SESSION['room_name']);
+            unset($_SESSION['amount']);
+            
+            $_SESSION['success_message'] = "Payment completed successfully!";
+            header("Location: index.php?page=payments");
+            exit;
+        } else if ($transaction_status === 'expire' || $transaction_status === 'failure' || 
+                  $transaction_status === 'deny' || $transaction_status === 'cancel') {
+            
+            // Update status
+            $stmt = $pdo->prepare("
+                UPDATE payments 
+                SET transaction_status = ?, status = 'expired'
+                WHERE id = ?
+            ");
+            $stmt->execute([$transaction_status, $payment_id]);
+            
+            // Redirect to payments page
+            unset($_SESSION['midtrans_token']);
+            unset($_SESSION['payment_id']);
+            unset($_SESSION['order_id']);
+            unset($_SESSION['room_name']);
+            unset($_SESSION['amount']);
+            
+            $_SESSION['error_message'] = "Payment was " . $transaction_status . ". Please try again.";
+            header("Location: index.php?page=payments");
+            exit;
+        }
+        
+        // Update the database with the latest status
+        $stmt = $pdo->prepare("
+            UPDATE payments 
+            SET transaction_status = ?, status = ?
+            WHERE id = ?
+        ");
+        $stmt->execute([$transaction_status, $payment_status, $payment_id]);
+    }
+}
+
+// For debugging purposes - uncomment to see debug info
+// echo '<pre>' . print_r($debug_info, true) . '</pre>';
 ?>
 
 <div class="payment-page">
@@ -59,7 +202,7 @@ if ($payment_status === 'settlement' || $payment_status === 'capture') {
         <div class="payment-details">
             <div class="detail-row">
                 <span class="detail-label">Room:</span>
-                <span class="detail-value"><?php echo $room_name; ?></span>
+                <span class="detail-value"><?php echo htmlspecialchars($room_name); ?></span>
             </div>
             <div class="detail-row">
                 <span class="detail-label">Amount:</span>
@@ -67,7 +210,7 @@ if ($payment_status === 'settlement' || $payment_status === 'capture') {
             </div>
             <div class="detail-row">
                 <span class="detail-label">Order ID:</span>
-                <span class="detail-value"><?php echo $order_id; ?></span>
+                <span class="detail-value"><?php echo htmlspecialchars($order_id); ?></span>
             </div>
         </div>
         
@@ -203,22 +346,36 @@ if ($payment_status === 'settlement' || $payment_status === 'capture') {
             // Show Snap payment page
             snap.pay('<?php echo $token; ?>', {
                 onSuccess: function(result) {
-                    /* You can add code here to handle the success payment */
+                    console.log('Success:', result);
                     window.location.href = 'index.php?page=midtrans-callback&status=success&order_id=<?php echo $order_id; ?>';
                 },
                 onPending: function(result) {
-                    /* You can add code here to handle the pending payment */
+                    console.log('Pending:', result);
                     window.location.href = 'index.php?page=midtrans-callback&status=pending&order_id=<?php echo $order_id; ?>';
                 },
                 onError: function(result) {
-                    /* You can add code here to handle the error payment */
-                    window.location.href = 'index.php?page=midtrans-callback&status=error&order_id=<?php echo $order_id; ?>';
+                    console.log('Error:', result);
+                    // Check the error code from Midtrans
+                    if (result.status_code === "406") {
+                        alert("Payment session has expired. You will be redirected to create a new payment.");
+                        window.location.href = 'index.php?page=payments';
+                    } else {
+                        window.location.href = 'index.php?page=midtrans-callback&status=error&order_id=<?php echo $order_id; ?>';
+                    }
                 },
                 onClose: function() {
-                    /* You can add code here to handle the customer closed the popup without finishing the payment */
                     console.log('Customer closed the payment window');
+                    window.location.href = 'index.php?page=payments';
                 }
             });
         });
+        
+        // Auto-trigger payment window on page load
+        // Uncomment this if you want the payment window to open automatically
+        /*
+        setTimeout(function() {
+            document.getElementById('pay-button').click();
+        }, 1000);
+        */
     });
 </script>
