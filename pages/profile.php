@@ -34,9 +34,9 @@ $page_title = "My Profile";
                 <i class="fas fa-edit"></i> Edit Profile
             </a>
             <?php if ($tenant && $user['role'] !== 'admin'): ?>
-                <a href="index.php?page=change-room" class="btn btn-secondary">
+                <!-- <a href="index.php?page=change-room" class="btn btn-secondary">
                     <i class="fas fa-exchange-alt"></i> Change Room
-                </a>
+                </a> -->
             <?php endif; ?>
         </div>
     </div>
